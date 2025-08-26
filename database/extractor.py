@@ -2,9 +2,9 @@ import logging
 from typing import Dict
 from bson import ObjectId
 
-from connection import get_database
-from models import TenantSchema, FieldMapping, CollectionInfo
-from category_extracter import extract_categorical_fields
+from database.connection import get_database
+from database.models import TenantSchema, FieldMapping, CollectionInfo
+from database.category_extracter import extract_categorical_fields
 
 logger = logging.getLogger(__name__)
 

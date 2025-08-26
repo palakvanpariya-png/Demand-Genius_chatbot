@@ -86,5 +86,5 @@ if __name__ == "__main__":
 
     result = execute_query(parsed_result)
     print(result)
-    # print("Execution Result:")
-    # print(json.dumps(result, indent=2))
+    print("Execution Result:")
+    print(json.dumps(result, indent=2))

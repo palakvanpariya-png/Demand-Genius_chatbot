@@ -3,7 +3,7 @@ from bson import ObjectId
 from typing import Dict, List, Optional, Any
 import logging
 from dataclasses import dataclass
-from category_extracter import extract_categorical_fields
+from database.category_extracter import extract_categorical_fields
 
 MONGO_URI = "mongodb://localhost:27017"
 DB_NAME = "my_database"
