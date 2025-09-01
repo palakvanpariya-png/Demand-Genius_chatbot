@@ -67,6 +67,15 @@ class QueryRouter:
     
     def _execute_list_query(self, parsed_query: QueryResult, page: int, page_size: int) -> QueryResponse:
         """Execute content listing queries with filters"""
+        limit = 50
+        skip = 0
+        if getattr(parsed_query, "pagination", None):
+            limit = parsed_query.pagination.get("limit", 50) or 50
+            skip  = parsed_query.pagination.get("skip", 0) or 0
+
+        page_size = max(1, min(limit, 200))         
+        page = (skip // page_size) + 1   
+
         try:
             results = self.executor.fetch_content_by_filters(
                 tenant_id=parsed_query.tenant_id,
@@ -145,6 +154,11 @@ class QueryRouter:
     
     def _execute_semantic_query(self, parsed_query: QueryResult) -> QueryResponse:
         """Execute semantic/text search queries"""
+        limit = 50
+        skip = 0
+        if getattr(parsed_query, "pagination", None):
+            limit = parsed_query.pagination.get("limit", 50) or 50
+            skip  = parsed_query.pagination.get("skip", 0) or 0
         try:
             results = self.executor.fetch_content_by_semantic_search(
                 tenant_id=parsed_query.tenant_id,

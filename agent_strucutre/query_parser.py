@@ -81,16 +81,16 @@ class SmartQueryParser:
                     "parameters": {
                         "type": "object",
                         "properties": {
-                           "route": {
-                            "type": "string",
-                            "enum": ["database", "advisory"],
-                            "description": "database=get data, advisory=business insights"
-                        },
-                        "operation": {
-                            "type": "string",
-                            "enum": ["list", "distribution", "semantic", "pure advisory"],
-                            "description": "list=show items, count=total, aggregate=group by, insight=advisory"
-                        },
+                            "route": {
+                                "type": "string",
+                                "enum": ["database", "advisory"],
+                                "description": "database=get data, advisory=business insights"
+                            },
+                            "operation": {
+                                "type": "string",
+                                "enum": ["list", "distribution", "semantic", "pure advisory"],
+                                "description": "list=show items, distribution=group by, semantic=text search, pure advisory=insights only"
+                            },
                             "filters": {
                                 "type": "object",
                                 "properties": filter_props,
@@ -102,28 +102,37 @@ class SmartQueryParser:
                                         "type": "object",
                                         "properties": {
                                             "start_date": {"anyOf": [{"type": "string", "format": "date"}, {"type": "null"}]},
-                                            "end_date": {"anyOf": [{"type": "string", "format": "date"}, {"type": "null"}]}
+                                            "end_date":   {"anyOf": [{"type": "string", "format": "date"}, {"type": "null"}]}
                                         },
                                         "required": ["start_date", "end_date"],
                                         "additionalProperties": False
                                     },
                                     {"type": "null"}
                                 ]
-                            }
-                            ,
+                            },
                             "marketing_filter": {"type": ["boolean", "null"]},
                             "is_negation": {"type": "boolean"},
                             "semantic_terms": {
                                 "type": "array",
                                 "items": {"type": "string"}
                             },
-                            "needs_data": {"type": "boolean"}
+                            "needs_data": {"type": "boolean"},
+                            "pagination": {
+                                "type": ["object", "null"],
+                                "properties": {
+                                    "skip":  {"type": "integer", "minimum": 0,  "default": 0},
+                                    "limit": {"type": "integer", "minimum": 1,  "maximum": 200, "default": 50}
+                                },
+                                "required": [],
+                                "additionalProperties": False
+                            }
                         },
                         "required": ["route", "operation", "filters", "is_negation", "needs_data"]
                     }
                 }
             }
         ]
+
         
         categories_context = json.dumps(categories, indent=2) 
         field_mappings_context = json.dumps(field_mappings, indent=2)
@@ -158,6 +167,16 @@ RULES:
 - "between DATE1 and DATE2" → start_date = DATE1, end_date = DATE2
 - Always return dates in YYYY-MM-DD format
 - If only one date boundary is specified in the query, set the other to null
+PAGINATION RULES:
+- Output pagination as: { "pagination": { "skip": <int>, "limit": <int> } }.
+- Default: skip=0, limit=50. Cap limit at 200.
+- "top N", "first N", "show N", "limit N" → set limit=N (skip stays 0 unless page is specified).
+- "page P of size S" or "page P, S per page" → limit=S, skip=(P-1)*S. (P is 1-based.)
+- "page P" with no size → use default S=50 → limit=50, skip=(P-1)*50.
+- "offset K" → skip=K, keep existing or default limit.
+- If user asks for "all", set limit=200 (cap) unless business rules specify otherwise.
+- Never encode pagination into filters; keep it only under "pagination".
+
 
 
 CONTEXT:

@@ -79,15 +79,20 @@ class MongoQueryExecutor:
             
         return pipeline
 
-    def fetch_content_by_filters(self, tenant_id: str, filters: Dict[str, List[str]], 
-                            date_filter: Optional[Dict[str, str]] = None,
-                            marketing_filter: Optional[bool] = None,
-                            is_negation: bool = False,
-                            page: int = 1,
-                                page_size: int = 50) -> Dict[str, Any]:
+    def fetch_content_by_filters(
+    self,
+    tenant_id: str,
+    filters: Dict[str, List[str]],
+    date_filter: Optional[Dict[str, str]] = None,
+    marketing_filter: Optional[bool] = None,
+    is_negation: bool = False,
+    skip: int = 0,               # 👈 directly take skip
+    limit: int = 50              # 👈 directly take limit
+) -> Dict[str, Any]:
         """
-        Fetch content with complex filters including dates and marketing content
-        Returns both data and total count for pagination and advisory insights
+        Fetch content with complex filters including dates and marketing content.
+        Pure executor: expects skip/limit already computed by QueryRouter.
+        Returns both data and total count for advisory/pagination UI.
         """
         db = self._get_db()
         tenant_obj_id = ObjectId(tenant_id)
@@ -147,28 +152,24 @@ class MongoQueryExecutor:
         if category_conditions:
             match_query.update({k: v for cond in category_conditions for k, v in cond.items()})
         
-        # Calculate pagination
-        skip = (page - 1) * page_size
-        
         # Get total count
         count_pipeline = [{"$match": match_query}, {"$count": "total"}]
         count_result = list(db.sitemaps.aggregate(count_pipeline))
         total_count = count_result[0]["total"] if count_result else 0
         
-        # Execute query with lookups
-        pipeline = self._build_lookup_pipeline(match_query, skip, page_size)
+        # Execute query with lookups and pagination
+        pipeline = self._build_lookup_pipeline(match_query, skip, limit)
         data = list(db.sitemaps.aggregate(pipeline))
-        total_pages = (total_count + page_size - 1) // page_size
         
         return {
             "data": data,
             "total_count": total_count,
-            "page": page,
-            "page_size": page_size,
-            "total_pages": total_pages,
-            "has_next": page < total_pages,
-            "has_prev": page > 1
+            "skip": skip,
+            "limit": limit,
+            "has_next": skip + limit < total_count,
+            "has_prev": skip > 0
         }
+
 
     def fetch_content_by_semantic_search(self, tenant_id: str, search_terms: List[str],
                                         additional_filters: Dict[str, List[str]] = None) -> List[Dict[str, Any]]:

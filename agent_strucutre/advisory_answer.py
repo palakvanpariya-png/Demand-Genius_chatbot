@@ -48,6 +48,7 @@ class SimpleAdvisoryAgent:
         
         # Step 1: Get data using your existing query router
         query_result = self.query_router.execute_query(question, self.current_tenant)
+        print(query_result)
         
         # Step 2: Let LLM handle EVERYTHING
         response = self._ask_llm(question, query_result)

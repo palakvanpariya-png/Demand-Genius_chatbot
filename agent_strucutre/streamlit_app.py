@@ -59,18 +59,14 @@ CONTEXT:
 USER QUESTION: "{question}"
 
 INSTRUCTIONS:
-- Do not answer questions which are irrelevant 
-- Do not make assumptions if you don't already know the context
-- Strictly do not answer irrelevant questions 
 - Provide direct, helpful answers
-- Use specific numbers from the data when available strictly
-- Give strategic insights and recommendations 
+- Use specific numbers from the data when available
+- Give strategic insights and recommendations
 - If it's a distribution query, analyze balance and identify gaps
 - If it's a list query, summarize findings and offer next steps  
 - If no data or query failed, still try to help with general advice
 - Be conversational and concise
 - Suggest relevant follow-up questions naturally
-- keep the results from database separated and then give analysis on that data but without context do not make assumptions 
 
 Answer the user's question now:"""
 
@@ -79,7 +75,7 @@ Answer the user's question now:"""
         # Stream response
         full_response = ""
         stream = advisor.client.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-4.1",
             messages=[{"role": "user", "content": prompt}],
             stream=True,
             temperature=0
