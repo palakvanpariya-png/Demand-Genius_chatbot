@@ -1,24 +1,33 @@
 import os
 import json
+import time
+import logging
 from datetime import datetime
 from openai import OpenAI
 from dotenv import load_dotenv
 from typing import Dict, List, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 load_dotenv()
+
+# Configure logging
+logger = logging.getLogger(__name__)
 
 @dataclass
 class QueryResult:
     route: str
     operation: str
-    filters: Dict[str, List[str]]
+    filters: Dict[str, Dict[str, List[str]]] 
     date_filter: Optional[Dict[str, str]]
     marketing_filter: Optional[bool]
-    is_negation: bool
+    is_negation: bool 
     semantic_terms: List[str]
     tenant_id: str
     needs_data: bool
+    distribution_fields: List[str] = field(default_factory=list)
+    pagination: Dict[str, int] = field(default_factory=lambda: {"skip": 0, "limit": 50})  # ADD THIS LINE
+
+
 
 
 class SmartQueryParser:
@@ -30,19 +39,43 @@ class SmartQueryParser:
     
     def parse(self, query_text: str, tenant_id: str) -> QueryResult:
         """Parse query using OpenAI with full schema context"""
+        # Input validation
+        if not query_text or not query_text.strip():
+            raise ValueError("query_text cannot be empty")
+        if not tenant_id or not tenant_id.strip():
+            raise ValueError("tenant_id cannot be empty")
+            
         schema_data = self._get_cached_schema(tenant_id)
         parsed = self._ai_parse(query_text, schema_data)
+
+        filters = parsed.get("filters", {})
+
+        # Backward-compatible: if filters are list-style, wrap into {"include": ...}
+        for cat, val in list(filters.items()):
+            if isinstance(val, list):
+                filters[cat] = {"include": val, "exclude": []}
+            elif isinstance(val, dict):
+                filters[cat].setdefault("include", [])
+                filters[cat].setdefault("exclude", [])
+            else:
+                filters[cat] = {"include": [str(val)], "exclude": []}
+
+        pagination_data = parsed.get("pagination", {"skip": 0, "limit": 50})
+        if pagination_data is None:
+            pagination_data = {"skip": 0, "limit": 50}
 
         return QueryResult(
             route=parsed["route"],
             operation=parsed["operation"],
-            filters=parsed.get("filters", {}),
+            filters=filters,
             date_filter=parsed.get("date_filter"),
             marketing_filter=parsed.get("marketing_filter"),
             is_negation=parsed.get("is_negation", False),
             semantic_terms=parsed.get("semantic_terms", []),
             tenant_id=tenant_id,
             needs_data=parsed.get("needs_data", False),
+            distribution_fields=parsed.get("distribution_fields", []),
+            pagination=pagination_data  # ADD THIS LINE
         )
     
     def _get_cached_schema(self, tenant_id: str) -> Dict:
@@ -52,24 +85,58 @@ class SmartQueryParser:
             schema_data = get_tenant_schema(self.mongo_uri, self.db_name, tenant_id)
             if not schema_data:
                 raise ValueError(f"Tenant {tenant_id} not found")
+            
+            # Validate schema structure
+            if not isinstance(schema_data.get("categories", {}), dict):
+                raise ValueError(f"Invalid schema structure for tenant {tenant_id}: categories must be dict")
+                
             self._schema_cache[tenant_id] = schema_data
         return self._schema_cache[tenant_id]
     
+    def _get_fallback_response(self, query_text: str) -> Dict:
+        return {
+            "route": "semantic",
+            "operation": "semantic",
+            "filters": {},
+            "date_filter": None,
+            "marketing_filter": None,
+            "is_negation": False,
+            "semantic_terms": [query_text],
+            "needs_data": False,
+            "distribution_fields": [],
+            "pagination": {"skip": 0, "limit": 50}  # ADD THIS LINE
+        }
+
+    
+    def _handle_large_schema(self, query_text: str, schema_data: Dict) -> Dict:
+        """Handle queries for tenants with large schemas (>5000 values)"""
+        logger.info(f"Using fallback for large schema with {schema_data.get('summary', {}).get('total_values', 0)} values")
+        return self._get_fallback_response(query_text)
+    
     def _ai_parse(self, query_text: str, schema_data: Dict) -> Dict:
-        """Use OpenAI to parse natural language query into structured fields"""
+        """Use OpenAI to parse natural language query into structured fields with retry logic"""
         
+        # Check for large schema safeguard
+        summary = schema_data.get("summary", {})
+        total_values = summary.get("total_values", 0)
+        
+        if total_values > 5000:
+            logger.info(f"Schema too large ({total_values} values), using dynamic handler")
+            return self._handle_large_schema(query_text, schema_data)
+        
+        # Proceed with normal schema building for smaller schemas
         categories = schema_data.get("categories", {}) 
         field_mappings = schema_data.get("field_mappings", {})
 
-        # Build dynamic schema from tenant metadata
+        # Build dynamic schema from tenant metadata - include all categories for negation support
         filter_props = {} 
-        for cat, values in categories.items(): 
-            if values:
-                filter_props[cat] = { 
-                    "type": "array", 
-                    "items": {"type": "string", "enum": values}, 
-                    "description": f"Values for {cat} category" 
-                }
+        for cat, values in categories.items():
+            # Include categories even if they have empty values (for negation queries)
+            filter_props[cat] = { 
+                "type": "array", 
+                "items": {"type": "string", "enum": values if values else []}, 
+                "description": f"Values for {cat} category" 
+            }
 
         # Define tool schema dynamically
         tool_schema = [
@@ -88,12 +155,28 @@ class SmartQueryParser:
                             },
                             "operation": {
                                 "type": "string",
-                                "enum": ["list", "distribution", "semantic", "pure advisory"],
+                                "enum": ["list", "distribution", "semantic", "pure_advisory"],
                                 "description": "list=show items, distribution=group by, semantic=text search, pure advisory=insights only"
                             },
                             "filters": {
                                 "type": "object",
-                                "properties": filter_props,
+                                "properties": {
+                                    cat: {
+                                        "type": "object",
+                                        "properties": {
+                                            "include": {
+                                                "type": "array",
+                                                "items": {"type": "string", "enum": values if values else []}
+                                            },
+                                            "exclude": {
+                                                "type": "array",
+                                                "items": {"type": "string", "enum": values if values else []}
+                                            }
+                                        },
+                                        "additionalProperties": False
+                                    }
+                                    for cat, values in categories.items()
+                                },
                                 "additionalProperties": False
                             },
                             "date_filter": {
@@ -120,12 +203,20 @@ class SmartQueryParser:
                             "pagination": {
                                 "type": ["object", "null"],
                                 "properties": {
-                                    "skip":  {"type": "integer", "minimum": 0,  "default": 0},
-                                    "limit": {"type": "integer", "minimum": 1,  "maximum": 200, "default": 50}
+                                    "skip":  {"type": "integer", "minimum": -2, "default": 0},  # Allow -1, -2
+                                    "limit": {"type": "integer", "minimum": 0,  "maximum": 200, "default": 50}
                                 },
                                 "required": [],
                                 "additionalProperties": False
-                            }
+                            },
+                            "distribution_fields": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string",
+                                    "enum": list(categories.keys())  # Only allow valid category names
+                                },
+                                "description": "List of categories to group by for multi-dim distributions. Must be from available categories."
+                            },
                         },
                         "required": ["route", "operation", "filters", "is_negation", "needs_data"]
                     }
@@ -138,71 +229,92 @@ class SmartQueryParser:
         field_mappings_context = json.dumps(field_mappings, indent=2)
         today = datetime.today().strftime("%Y-%m-%d")
 
-
         # Refined system message
         system_message = f"""
-You are a query parser for a content management system. 
-Your job is to classify user queries into structured operations and extract parameters. 
-Always return valid JSON that matches the provided schema, the categories you exrtact should match with the category values we have in our schema and always give 
-priority to exact match to fuzzy match that is scrict rule.
+You are a query parser for a content management system. Parse user queries into structured JSON operations matching the provided schema.
 
-RULES:
-- If query explicitly mentions a **category name or field** (e.g., "funnel stage", "persona"), 
-  set the operation to `distribution` and include **all values** of that category in `filters`.
-- If the query uses negation (e.g., "not TOFU", "without investors"), 
-  still include the positive category value in `filters` (e.g., ["TOFU"]) 
-  and set `is_negation` = true. 
-  ❌ Never use operators like $ne, exclude, not_in inside filters. 
+**CORE RULES:**
+- Always match to existing categories/values - never create new ones
+- Prioritize exact matches, but attempt semantic matching for unmatched terms
+- ALWAYS return exact schema values, regardless of input format variations
+- Return valid JSON matching the schema
 
-- If query explicitly mentions a **category value** (e.g., "TOFU", "Investors"), 
-  set the operation appropriately (`distribution` or `list`) and include that value under the correct category in `filters`.
-- Parse natural language date ranges into start_date and end_date (YYYY-MM-DD).
-- Detect negations (e.g., "missing", "without", "don’t have").
-- Detect if query refers to marketing vs non-marketing content.
-- Always map mentioned fields/terms to closest category or value from schema.
-- Do not make categories on your own always try to match it with categories taken from schems.
-- Reference date for all relative time expressions (like "last 6 months" or "more than 3 weeks ago") is {today}.
+
+**OPERATIONS:**
+- `list` → fetch content/items
+- `distribution` → analyze proportions/breakdowns of categories  
+- `semantic` → free-text search not tied to categories
+- `pure_advisory` → strategic advice requiring no database
+
+**KEY LOGIC:**
+- Category name mentioned → `distribution` with all category values in filters
+- Category value mentioned → appropriate operation with that value filtered  
+- Advisory questions needing data → use `distribution` operation
+- Marketing detection → set `marketing_filter: true/false` based on if the query is related to marketing related context or explicitly says marketing content
+- Negation ("not X", "without Y") → `"is_negation": true` + exclude arrays
+- "Distribution of x"-> "distribution_fields": ["X"] or "Distribution of X across Y" → `"distribution_fields": ["X", "Y"]`
+
+**DATES:** Reference: {today}
 - "last N days/weeks/months" → start_date = today - N, end_date = today
-- "more than N days/weeks/months ago" → start_date = None (or very old), end_date = today - N
-- "between DATE1 and DATE2" → start_date = DATE1, end_date = DATE2
-- Always return dates in YYYY-MM-DD format
-- If only one date boundary is specified in the query, set the other to null
-PAGINATION RULES:
-- Output pagination as: { "pagination": { "skip": <int>, "limit": <int> } }.
-- Default: skip=0, limit=50. Cap limit at 200.
-- "top N", "first N", "show N", "limit N" → set limit=N (skip stays 0 unless page is specified).
-- "page P of size S" or "page P, S per page" → limit=S, skip=(P-1)*S. (P is 1-based.)
-- "page P" with no size → use default S=50 → limit=50, skip=(P-1)*50.
-- "offset K" → skip=K, keep existing or default limit.
-- If user asks for "all", set limit=200 (cap) unless business rules specify otherwise.
-- Never encode pagination into filters; keep it only under "pagination".
+- "more than N ago" → end_date = today - N, start_date = null
+- Format: YYYY-MM-DD
 
+**PAGINATION:** Default: skip=0, limit=50
+- "top N" → limit = N
+- "page P" → skip = (P-1)*50, limit = 50  
+- "last N" → skip = -1, limit = N
+- "count only" → skip = -2, limit = 0
+- "all" → limit = 200
 
-
-CONTEXT:
+**CONTEXT:**
 - Categories: {categories_context}
 - Field mappings: {field_mappings_context}
-
-OPERATIONS:
-- list → request to fetch content/items
-- distribution → request to analyze proportions, balance, or breakdown of categories also trigger the filter field for example
-  " show me X content distribution over Y content then trigger both those filters   "
-- semantic → free-text or topical search when not directly tied to categories
-- pure_advisory → high-level strategic advice with no database need
 """
 
-        completion = self.client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": system_message},
-                {"role": "user", "content": query_text}
-            ],
-            tools=tool_schema,
-            tool_choice={"type": "function", "function": {"name": "parse_query"}},
-            temperature=0
-        )
 
-        return json.loads(completion.choices[0].message.tool_calls[0].function.arguments)
+
+        # Retry logic with exponential backoff
+        max_retries = 3
+        base_delay = 1  # Start with 1 second delay
+        
+        for attempt in range(max_retries):
+            try:
+                completion = self.client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=[
+                        {"role": "system", "content": system_message},
+                        {"role": "user", "content": query_text}
+                    ],
+                    tools=tool_schema,
+                    tool_choice={"type": "function", "function": {"name": "parse_query"}},
+                    temperature=0
+                )
+                
+                # Parse and return the result
+                result = json.loads(completion.choices[0].message.tool_calls[0].function.arguments)
+                return result
+                
+            except json.JSONDecodeError as e:
+                logger.error(f"JSON parse error on attempt {attempt + 1}: {e}")
+                if attempt == max_retries - 1:
+                    logger.warning("AI fallback triggered due to JSON parse errors")
+                    return self._get_fallback_response(query_text)
+            except Exception as e:
+                # Log the specific error type for better debugging
+                error_type = type(e).__name__
+                logger.error(f"API error ({error_type}) on attempt {attempt + 1}: {e}")
+                if attempt == max_retries - 1:
+                    logger.warning("AI fallback triggered due to API errors")
+                    return self._get_fallback_response(query_text)
+            
+            # Exponential backoff: wait 1s, 2s, 4s between retries
+            if attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt)
+                time.sleep(delay)
+        
+        # This should never be reached, but included for safety
+        logger.warning("AI fallback triggered - unexpected code path")
+        return self._get_fallback_response(query_text)
 
     def clear_cache(self):
         """Clear schema cache if needed"""
@@ -214,7 +326,7 @@ def create_smart_parser(mongo_uri: str, db_name: str) -> SmartQueryParser:
     return SmartQueryParser(mongo_uri, db_name)
 
 
-# # Example usage
+# Example usage
 # if __name__ == "__main__":
 #     parser = create_smart_parser("mongodb://localhost:27017", "my_database")
     
@@ -225,12 +337,19 @@ def create_smart_parser(mongo_uri: str, db_name: str) -> SmartQueryParser:
 #         # "List all pages targeting Revenue Teams", 
 #         # "List all pages with no assigned funnel stage",
 #         # "What are the newest assets added in the last 30 days?",
-#         # " What funnel stages do we have the least content for?"
+#         # " What funnel stages do we have the least content for?",
 #         # "show me bofu content distribution over videos",
 #         # "list all the content that is not tofu",
 #         # "List all MOFU pages created after January 1st, 2025",
-#         # "Give me TOFU content published more than 6 months ago"
-#         "show me all content in tofu funnel stage"
+#         # "show me all content in tofu content which is not blogs",
+#         # "Give me TOFU content published more than 6 months ago",
+#         # "Hello what can you help me with"
+#         # "Give me blog posts tagged Marketing and Demand Generation that are in German",
+#         # "List all pages with no assigned funnel stage",
+#         # "What German language MOFU content … focuses on customer acquisition",
+#         # "List pages tagged as Thought Leadership but not gated",
+#         # "show me last 100 tofu content"
+       
 #     ]
     
 #     tenant_id = "6875f3afc8337606d54a7f37"
@@ -238,6 +357,7 @@ def create_smart_parser(mongo_uri: str, db_name: str) -> SmartQueryParser:
 #     for query in test_queries:
 #         try:
 #             result = parser.parse(query, tenant_id)
+#             # print(result)
 #             print(f"\n📝 Query: '{query}'")
 #             print(f"   Route: {result.route}")
 #             print(f"   Operation: {result.operation}")
@@ -247,5 +367,7 @@ def create_smart_parser(mongo_uri: str, db_name: str) -> SmartQueryParser:
 #             print(f"   Negation: {result.is_negation}")
 #             print(f"   Semantic Terms: {result.semantic_terms}")
 #             print(f"   Needs Data: {result.needs_data}")
+#             print(f"   Pagination: {result.pagination}")
+#             print(f"   Distribution fields: {result.distribution_fields}")
 #         except Exception as e:
 #             print(f"Error parsing '{query}': {e}")

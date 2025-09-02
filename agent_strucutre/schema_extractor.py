@@ -243,9 +243,10 @@ if __name__ == "__main__":
     
     # Get schema
     schema = get_tenant_schema(MONGO_URI, DB_NAME, TENANT_ID)
+    print(schema)
     
     # Print summary
-    print_schema_summary(schema)
+    # print_schema_summary(schema)
     
     # # Access specific information
     # print("\n💡 EXAMPLE USAGE:")

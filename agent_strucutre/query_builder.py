@@ -13,7 +13,107 @@ class MongoQueryExecutor:
         """Get database connection"""
         client = MongoClient(self.mongo_uri)
         return client[self.db_name]
+
+    # ===============================
+    # 🔹 NEW HELPER METHODS (Adapter)
+    # ===============================
+
+    def _convert_filters(self, filters: Dict[str, Dict[str, List[str]]], is_negation: bool) -> Dict[str, List[str]]:
+        """
+        Convert new filter format:
+        { "Category": {"include": [...], "exclude": [...]}}
+        → old flat format { "Category": [...] }
+        Negations handled separately via exclude arrays.
+        """
+        converted = {}
+        for cat, val in filters.items():
+            include = val.get("include", [])
+            exclude = val.get("exclude", [])
+            if include:
+                converted[cat] = include
+            elif exclude:
+                converted[cat] = exclude  # legacy paths only expected 1 array
+        return converted
+
+    def _convert_pagination(self, pagination: Optional[Dict[str, int]], total_count: int = 0) -> tuple[int, int, bool]:
+        """
+        Convert new pagination format → skip, limit
+        Special cases:
+          skip = -1 → last N items
+          skip = -2 → count only
+        """
+        if not pagination:
+            return 0, 50, False
+
+        skip = pagination.get("skip", 0)
+        limit = pagination.get("limit", 50)
+
+        # Handle special cases
+        if skip == -2:
+            return 0, 0, True  # count-only
+        if skip == -1 and total_count > 0:
+            # Last N items: take from end
+            return max(total_count - limit, 0), limit, False
+
+        return skip, limit, False
     
+    # =======================================
+    # 🔹 MAIN INTEGRATION METHOD (Entry Point)
+    # =======================================
+
+    def execute_parsed_query(self, query_result) -> Any:
+        """
+        Main entrypoint for executing a parsed query.
+        Uses adapter pattern to map QueryResult → existing executor methods.
+        """
+        tenant_id = query_result.tenant_id
+        filters = self._convert_filters(query_result.filters, query_result.is_negation)
+
+        # Pagination conversion (may need total count)
+        skip, limit, count_only = self._convert_pagination(query_result.pagination)
+
+        if query_result.operation == "list":
+            if count_only:
+                return {"total_count": self.fetch_count_only(tenant_id, filters, query_result.date_filter,
+                                                             query_result.marketing_filter, query_result.is_negation)}
+            return self.fetch_content_by_filters(
+                tenant_id=tenant_id,
+                filters=filters,
+                date_filter=query_result.date_filter,
+                marketing_filter=query_result.marketing_filter,
+                is_negation=query_result.is_negation,
+                skip=skip,
+                limit=limit
+            )
+
+        elif query_result.operation == "semantic":
+            return self.fetch_content_by_semantic_search(
+                tenant_id=tenant_id,
+                search_terms=query_result.semantic_terms,
+                additional_filters=filters
+            )
+
+        elif query_result.operation == "distribution":
+            results = []
+            for field in query_result.distribution_fields or []:
+                results.append({
+                    "field": field,
+                    "distribution": self.fetch_content_by_distribution(
+                        tenant_id=tenant_id,
+                        category=field,
+                        values=filters.get(field, []),
+                        additional_filters=filters
+                    )
+                })
+            return results
+
+        elif query_result.operation == "pure advisory":
+            # Advisory → no DB query
+            return {"message": "Advisory query - no database execution required"}
+
+        else:
+            raise ValueError(f"Unsupported operation: {query_result.operation}")
+
     def _build_category_lookup(self, category_names: List[str]) -> List[ObjectId]:
         """Convert category attribute names to ObjectIds"""
         if not category_names:
@@ -80,15 +180,15 @@ class MongoQueryExecutor:
         return pipeline
 
     def fetch_content_by_filters(
-    self,
-    tenant_id: str,
-    filters: Dict[str, List[str]],
-    date_filter: Optional[Dict[str, str]] = None,
-    marketing_filter: Optional[bool] = None,
-    is_negation: bool = False,
-    skip: int = 0,               # 👈 directly take skip
-    limit: int = 50              # 👈 directly take limit
-) -> Dict[str, Any]:
+        self,
+        tenant_id: str,
+        filters: Dict[str, List[str]],
+        date_filter: Optional[Dict[str, str]] = None,
+        marketing_filter: Optional[bool] = None,
+        is_negation: bool = False,
+        skip: int = 0,
+        limit: int = 50
+    ) -> Dict[str, Any]:
         """
         Fetch content with complex filters including dates and marketing content.
         Pure executor: expects skip/limit already computed by QueryRouter.
@@ -220,8 +320,8 @@ class MongoQueryExecutor:
         return list(db.sitemaps.aggregate(pipeline))
         
     def fetch_content_by_distribution(self, tenant_id: str, category: str, 
-                                  values: List[str] = None,
-                                  additional_filters: Dict[str, List[str]] = None) -> List[Dict[str, Any]]:
+                                      values: List[str] = None,
+                                      additional_filters: Dict[str, List[str]] = None) -> List[Dict[str, Any]]:
         """
         Get distribution/count of content by category.
         If values provided, filter by those values first then count.
@@ -322,56 +422,24 @@ class MongoQueryExecutor:
 
         return list(db.sitemaps.aggregate(pipeline))
 
-
+    def fetch_count_only(self, tenant_id: str, filters: Dict[str, List[str]],
+                            date_filter: Optional[Dict[str, str]], marketing_filter: Optional[bool],
+                            is_negation: bool) -> int:
+            """
+            Lightweight count query for pagination skip=-2
+            """
+            result = self.fetch_content_by_filters(
+                tenant_id=tenant_id,
+                filters=filters,
+                date_filter=date_filter,
+                marketing_filter=marketing_filter,
+                is_negation=is_negation,
+                skip=0,
+                limit=0
+            )
+            return result["total_count"]
 # Factory function
 def create_mongo_executor(mongo_uri: str, db_name: str) -> MongoQueryExecutor:
     return MongoQueryExecutor(mongo_uri, db_name)
 
 
-# # Example usage
-# if __name__ == "__main__":
-#     executor = create_mongo_executor("mongodb://localhost:27017", "my_database")
-#     tenant_id = "6875f3afc8337606d54a7f37"
-    
-#     # Test filter query with pagination
-#     print("=== FILTER QUERY WITH PAGINATION ===")
-#     results = executor.fetch_content_by_filters(
-#         tenant_id=tenant_id,
-#         filters={"Funnel Stage": ["TOFU"], "Language": ["English"]},
-#         marketing_filter=False,
-#         page=1,
-#         page_size=25
-#     )
-#     print(f"Page {results['page']}/{results['total_pages']}")
-#     print(f"Total matching documents: {results['total_count']}")
-#     print(f"Showing {len(results['data'])} documents")
-#     print(f"Has next page: {results['has_next']}")
-    
-#     # Get next page
-#     if results['has_next']:
-#         page2_results = executor.fetch_content_by_filters(
-#             tenant_id=tenant_id,
-#             filters={"Funnel Stage": ["TOFU"], "Language": ["English"]},
-#             marketing_filter=False,
-#             page=2,
-#             page_size=25
-#         )
-#         print(f"\nNext page has {len(page2_results['data'])} documents")
-    
-#     # Test distribution query  
-#     print("\n=== DISTRIBUTION QUERY ===")
-#     distribution = executor.fetch_content_by_distribution(
-#         tenant_id=tenant_id,
-#         values=["Tofu"],
-#         category="Funnel Stage"
-#     )
-#     print(distribution)
-#     print(f"Funnel Stage distribution: {distribution}")
-    
-#     # Test semantic search
-#     print("\n=== SEMANTIC SEARCH ===") 
-#     semantic_results = executor.fetch_content_by_semantic_search(
-#         tenant_id=tenant_id,
-#         search_terms=["investment", "crypto"]
-#     )
-#     print(f"Found {len(semantic_results)} semantic results")
